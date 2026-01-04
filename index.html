@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<title>像素打磚塊 · 10倍隕石 + Shake</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+html,body{margin:0;height:100%;overflow:hidden;background:#000;}
+#container{position:fixed;left:50%;top:50%;transform-origin:center;}
+canvas{display:block;background:#000;image-rendering:pixelated;}
+</style>
+</head>
+<body>
+<div id="container"><canvas id="game"></canvas></div>
+<script>
+(()=>{
+// ===== 基本畫布（直立滿版） =====
+const cvs=document.getElementById("game"),ctx=cvs.getContext("2d");
+const container=document.getElementById("container");
+const W=540,H=960; cvs.width=W; cvs.height=H;
+function layout(){
+  const sw=innerWidth,sh=innerHeight;
+  const s=Math.min(sw/H,sh/W);
+  container.style.transform=`translate(-50%,-50%) rotate(90deg) scale(${s})`;
+}
+addEventListener("resize",layout);layout();
+
+// ===== 狀態 =====
+const paddle={baseW:160,w:160,h:20,x:(W-160)/2,y:H-80,enlargeUntil:0,enlargePhase:0};
+let balls=[],bricks=[],particles=[],trail=[],flashes=[];
+let state="play",failTimer=0;
+const shake={t:0,amp:0}; // 畫面震動
+
+// ===== 小工具 =====
+function clamp(v,min,max){return Math.max(min,Math.min(max,v));}
+function reflect(b,nx,ny){
+  const dot=b.vx*nx+b.vy*ny;
+  b.vx-=2*dot*nx; b.vy-=2*dot*ny;
+  const s=Math.hypot(b.vx,b.vy)||1, f=b.speed/s;
+  b.vx*=f; b.vy*=f;
+}
+function circleRectHit(b,rx,ry,rw,rh){
+  const nx=clamp(b.x,rx,rx+rw);
+  const ny=clamp(b.y,ry,ry+rh);
+  const dx=b.x-nx,dy=b.y-ny;
+  const r=b.meteorUntil>performance.now()?100:10; // 碰撞半徑也跟隕石狀態同步
+  return (dx*dx+dy*dy <= r*r);
+}
+function burst(x,y,color,count=16){
+  for(let i=0;i<count;i++){
+    const a=Math.random()*Math.PI*2, sp=Math.random()*2.6;
+    particles.push({x,y,vx:Math.cos(a)*sp,vy:Math.sin(a)*sp,life:28,color});
+  }
+}
+function flash(){ flashes.push({life:12}); }
+function addShake(intensity=6, duration=180){ shake.amp=Math.max(shake.amp,intensity); shake.t=Math.max(shake.t,duration); }
+
+// ===== 特殊磚效果（只留 2 種）=====
+function enlarge(){
+  paddle.w=paddle.baseW*1.9;
+  paddle.enlargeUntil=performance.now()+5000;
+  paddle.enlargePhase=1;
+  flash(); burst(paddle.x+paddle.w/2,paddle.y-10,"#39e071",30);
+  addShake(4,120);
+}
+function multiball(b){
+  const base=Math.atan2(b.vy,b.vx);
+  [-20,20].forEach(a=>{
+    const A=base+a*Math.PI/180;
+    balls.push({x:b.x,y:b.y,r:10,vx:Math.cos(A)*b.speed,vy:Math.sin(A)*b.speed,speed:b.speed,launched:true,meteorUntil:0});
+  });
+  // 原球變隕石（10倍）
+  b.meteorUntil=performance.now()+5000;
+  burst(b.x,b.y,"#ff8844",40); flash(); addShake(8,220);
+}
+
+// ===== 初始場景 =====
+function makeBricks(){
+  bricks=[];
+  const cols=8,rows=9, mx=25,my=100, bw=(W-mx*2)/cols, bh=40;
+  const pal=["#ff4b4b","#ffa14b","#ffea4b","#4bff80","#4bcaff","#b64bff"];
+  for(let r=0;r<rows;r++){
+    for(let c=0;c<cols;c++){
+      let type="normal",color=pal[(r+c)%pal.length];
+      const roll=Math.random();
+      if(roll<.08){type="enlarge";color="#39e071";}
+      else if(roll<.16){type="multiball";color="#b64bff";}
+      bricks.push({x:mx+c*bw,y:my+r*bh,w:bw-4,h:bh-4,color,type,alive:true});
+    }
+  }
+}
+function resetBall(){
+  balls=[{x:W/2,y:H-120,r:10,vx:0,vy:0,speed:5.2,launched:false,meteorUntil:0}];
+  trail.length=0;
+}
+
+// ===== 控制 =====
+document.addEventListener("mousemove",e=>{
+  const rect=cvs.getBoundingClientRect(), mx=e.clientY-rect.top;
+  paddle.x=clamp(mx-paddle.w/2,0,W-paddle.w);
+  for(const b of balls){ if(!b.launched){ b.x=paddle.x+paddle.w/2; b.y=paddle.y-b.r-2; } }
+});
+document.addEventListener("keydown",e=>{
+  if(e.code==="Space"){
+    const idle=balls.find(b=>!b.launched);
+    if(idle){
+      idle.launched=true;
+      const a=(-60+Math.random()*30)*Math.PI/180;
+      idle.vx=Math.cos(a)*idle.speed || Math.cos(a)*idle.speed;
+      idle.vy=-Math.abs(Math.sin(a))*idle.speed || -3.5;
+    }
+    if(state==="fail") reset();
+  }
+});
+
+// ===== 更新 =====
+function update(){
+  if(state==="fail"){ if(--failTimer<=0) reset(); return; }
+  const now=performance.now();
+
+  // 變大板到期
+  if(paddle.enlargeUntil && now>paddle.enlargeUntil){ paddle.w=paddle.baseW; paddle.enlargeUntil=0; paddle.enlargePhase=0; }
+
+  // 球
+  for(let i=balls.length-1;i>=0;i--){
+    const b=balls[i]; if(!b.launched) continue;
+
+    // 移動 + 拖尾
+    b.x+=b.vx; b.y+=b.vy;
+    const isMeteor = now<b.meteorUntil;
+    trail.push({x:b.x,y:b.y,life:isMeteor?28:20,meteor:isMeteor});
+    if(trail.length>300) trail.shift();
+
+    // 牆
+    if(b.x-(isMeteor?100:10)<0){ b.x=(isMeteor?100:10); reflect(b,1,0); }
+    if(b.x+(isMeteor?100:10)>W){ b.x=W-(isMeteor?100:10); reflect(b,-1,0); }
+    if(b.y-(isMeteor?100:10)<0){ b.y=(isMeteor?100:10); reflect(b,0,1); }
+
+    // 擋板
+    const rNow = isMeteor?100:10;
+    if(b.y+rNow>=paddle.y && b.x>=paddle.x && b.x<=paddle.x+paddle.w && b.vy>0){
+      b.y=paddle.y-rNow; reflect(b,0,-1);
+      if(isMeteor){ addShake(6,160); }
+    }
+
+    // 磚塊
+    for(const br of bricks){
+      if(!br.alive) continue;
+      if(circleRectHit(b,br.x,br.y,br.w,br.h)){
+        br.alive=false;
+        burst(br.x+br.w/2,br.y+br.h/2,br.color, isMeteor?26:20);
+        if(br.type==="enlarge") enlarge();
+        else if(br.type==="multiball") multiball(b);
+        reflect(b,0,1);
+        // 隕石撞擊更抖、更亮
+        if(isMeteor){ flash(); addShake(10,240); }
+        else{ addShake(3,120); }
+        break; // 一次只處理一顆
+      }
+    }
+
+    // 掉到底
+    if(b.y - rNow > H) balls.splice(i,1);
+  }
+
+  // 全部球都沒了 → fail
+  if(!balls.length){ state="fail"; failTimer=60; }
+
+  // 粒子更新
+  for(const p of particles){ p.x+=p.vx; p.y+=p.vy; p.vy+=.15; p.life--; }
+  particles = particles.filter(p=>p.life>0);
+  for(const t of trail) t.life--;
+  trail = trail.filter(t=>t.life>0);
+  for(const f of flashes) f.life--;
+  flashes = flashes.filter(f=>f.life>0);
+
+  // 震動衰減
+  if(shake.t>0){ shake.t-=16; shake.amp*=0.92; if(shake.t<=0){shake.t=0; shake.amp=0;} }
+}
+
+// ===== 繪製 =====
+function draw(){
+  // 畫面震動偏移
+  const dx = (shake.t>0? (Math.random()*2-1)*shake.amp : 0);
+  const dy = (shake.t>0? (Math.random()*2-1)*shake.amp : 0);
+
+  ctx.save();
+  ctx.translate(dx,dy);
+
+  // 背景像素格
+  ctx.fillStyle="#0a0a1a"; ctx.fillRect(0,0,W,H);
+  for(let y=0;y<H;y+=28){
+    for(let x=0;x<W;x+=28){
+      ctx.fillStyle=(x+y)%56===0?"#111a33":"#0d132a";
+      ctx.fillRect(x,y,28,28);
+    }
+  }
+
+  // 磚
+  for(const br of bricks){
+    if(!br.alive) continue;
+    ctx.fillStyle=br.color; ctx.fillRect(br.x,br.y,br.w,br.h);
+    ctx.fillStyle="#000"; ctx.fillRect(br.x,br.y+br.h-3,br.w,3);
+  }
+
+  // 底板 + 誇張能量閃
+  if(paddle.enlargePhase>0){
+    const t=(Math.sin(performance.now()/100)*0.5+0.5);
+    ctx.shadowBlur=28+Math.sin(performance.now()/120)*12;
+    ctx.shadowColor="#39e071";
+    ctx.fillStyle=`rgba(57,224,113,${0.45+0.4*t})`;
+  }else{
+    ctx.fillStyle="#d8d8d8";
+  }
+  ctx.fillRect(paddle.x,paddle.y,paddle.w,paddle.h);
+  ctx.shadowBlur=0;
+
+  // 拖尾（隕石更粗）
+  for(const t of trail){
+    const a=t.life/(t.meteor?28:20);
+    ctx.globalAlpha=a*0.6;
+    ctx.fillStyle=t.meteor?"#ff9b50":"#99d6ff";
+    ctx.beginPath();
+    ctx.arc(t.x,t.y,t.meteor?12:4,0,Math.PI*2);
+    ctx.fill();
+  }
+  ctx.globalAlpha=1;
+
+  // 球（隕石 10x 半透明+亮邊）
+  for(const b of balls){
+    const isMeteor = performance.now()<b.meteorUntil;
+    if(isMeteor){
+      const R = 100;
+      const g = ctx.createRadialGradient(b.x,b.y, R*0.2, b.x,b.y,R);
+      g.addColorStop(0,"rgba(255,224,176,0.85)");
+      g.addColorStop(0.6,"rgba(255,155,80,0.55)");
+      g.addColorStop(1,"rgba(255,120,40,0.25)");
+      ctx.fillStyle=g;
+      ctx.beginPath(); ctx.arc(b.x,b.y,R,0,Math.PI*2); ctx.fill();
+      // 亮邊
+      ctx.shadowBlur=22; ctx.shadowColor="#ffb066";
+      ctx.strokeStyle="rgba(255,200,120,0.8)"; ctx.lineWidth=2;
+      ctx.beginPath(); ctx.arc(b.x,b.y,R-2,0,Math.PI*2); ctx.stroke();
+      ctx.shadowBlur=0;
+    }else{
+      ctx.fillStyle="#fff";
+      ctx.beginPath(); ctx.arc(b.x,b.y,10,0,Math.PI*2); ctx.fill();
+    }
+  }
+
+  // 粒子
+  for(const p of particles){
+    ctx.globalAlpha=p.life/28; ctx.fillStyle=p.color; ctx.fillRect(p.x,p.y,3,3);
+  }
+  ctx.globalAlpha=1;
+
+  // Game Over
+  if(state==="fail"){
+    ctx.fillStyle="#fff"; ctx.font="bold 48px monospace"; ctx.textAlign="center";
+    ctx.fillText("GAME OVER",W/2,H/2);
+  }
+
+  // 白閃
+  for(const f of flashes){
+    ctx.globalAlpha=f.life/12*0.4; ctx.fillStyle="#fff"; ctx.fillRect(0,0,W,H);
+  }
+  ctx.globalAlpha=1;
+
+  // 掃描線 + 暈影
+  ctx.globalAlpha=0.15; ctx.fillStyle="#000";
+  for(let y=0;y<H;y+=3) ctx.fillRect(0,y,W,1);
+  ctx.globalAlpha=1;
+  const vign=ctx.createRadialGradient(W/2,H/2,0,W/2,H/2,W*0.8);
+  vign.addColorStop(0,"rgba(0,0,0,0)");
+  vign.addColorStop(1,"rgba(0,0,0,0.35)");
+  ctx.fillStyle=vign; ctx.fillRect(0,0,W,H);
+
+  ctx.restore();
+}
+
+// ===== 重置 / 迴圈 =====
+function reset(){
+  makeBricks(); particles=[]; trail=[]; flashes=[];
+  paddle.w=paddle.baseW; paddle.enlargeUntil=0; paddle.enlargePhase=0;
+  shake.t=0; shake.amp=0;
+  resetBall(); state="play";
+}
+function loop(){ update(); draw(); requestAnimationFrame(loop); }
+makeBricks(); resetBall(); loop();
+})();
+</script>
+</body>
+</html>
